@@ -10,7 +10,7 @@ We would love to hear from you! Here are some places you can find us.
 Our mailing list is
 [metallb-users@googlegroups.com](https://groups.google.com/forum/#!forum/metallb-users). It's
 for discussions around MetalLB usage, community support, and developer
-discussion (although for the latter we mostly use Github directly).
+discussion (although for the latter we mostly use GitHub directly).
 
 ## Slack
 
@@ -22,13 +22,6 @@ can join.
 
 Development of MetalLB is discussed in the [#metallb-dev slack channel
 ](https://kubernetes.slack.com/messages/metallb-dev/).
-
-## IRC
-
-If you prefer a more classic chat experience, we're also on `#metallb`
-on the Freenode IRC network. You can use Freenode's [web
-client](http://webchat.freenode.net?randomnick=1&channels=%23metallb&uio=d4)
-if you don't already have an IRC client.
 
 ## Issue Tracker
 
@@ -88,9 +81,12 @@ currently have, relative to the top-level directory:
 - `internal/config` parses and validates the MetalLB configmap.
 - `internal/allocator` is the IP address manager. Given pools from the
   MetalLB configmap, it can allocate addresses on demand.
-- `internal/bgp` is a _very_ stripped down implementation of BGP. It
+- `internal/bgp/native` is a _very_ stripped down implementation of BGP. It
   speaks just enough of the protocol to keep peering sessions up, and
   to push routes to the peer.
+- `internal/bgp/frr` contains the code for translating the MetalLB configuration
+   to the FRR configuration that is applied to the FRR container, when running
+   MetalLB in FRR mode.
 - `internal/layer2` is an implementation of an ARP and NDP responder.
 - `internal/logging` is a logging shim that redirects both
   Kubernetes's `klog` and Go's standard library `log` output to
@@ -141,23 +137,38 @@ When you're developing, running components at the command line and
 having them attach to a cluster might be more convenient than
 redeploying them to a cluster over and over.
 
-For the controller, the `-kubeconfig` and `-config-ns` command-line flags
+For the controller, the `-kubeconfig` and `-namespace` command-line flags
 are needed. Speakers need those and `-node-name`.
 
 For example:
 
- metallb$ go run ./controller/main.go ./controller/service.go -config-ns metallb-system -kubeconfig $KUBECONFIG
+```bash
+metallb$ go run ./controller/main.go ./controller/service.go -namespace metallb-system -kubeconfig $KUBECONFIG
 
- metallb$ go run ./speaker/main.go ./speaker/*controller.go -config-ns metallb-system -kubeconfig $KUBECONFIG -node-name node0
+metallb$ go run ./speaker/main.go ./speaker/*controller.go -namespace metallb-system -kubeconfig $KUBECONFIG -node-name node0
+```
 
 For development, fork
 the [github repository](https://github.com/metallb/metallb), and add
 your fork as a remote in `$GOPATH/src/go.universe.tf/metallb`, with
 `git remote add fork git@github.com:<your-github-user>/metallb.git`.
 
+## Commit Messages
+
+The following are our commit message guidelines:
+
+- Line wrap the body at 72 characters
+- For a more complete discussion of good git commit message practices, see
+  <https://chris.beams.io/posts/git-commit/>.
+
+## Extending the end to end test suite
+
+When adding a new feature, or modifying a current one, consider adding a new test
+to the test suite located in `/e2etest`.
+
 ## The website
 
-The website at https://metallb.universe.tf is pinned to the latest
+The website at <https://metallb.universe.tf> is pinned to the latest
 released version, so that users who don't care about ongoing
 development see documentation that is consistent with the released
 code.

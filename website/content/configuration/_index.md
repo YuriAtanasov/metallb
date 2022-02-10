@@ -4,20 +4,20 @@ weight: 4
 ---
 
 MetalLB remains idle until configured. This is accomplished by
-creating and deploying a configmap into the same namespace
+creating and deploying a config map into the same namespace
 (metallb-system) as the deployment.
 
-There is an example configmap in
+There is an example config map in
 [`manifests/example-config.yaml`](https://raw.githubusercontent.com/metallb/metallb/main/manifests/example-config.yaml),
 annotated with explanatory comments.
 
-If you've named the configmap `config.yaml`, you can deploy the manifest with `kubectl apply -f config.yaml`.
+If you've named the config map `config.yaml`, you can deploy the manifest with `kubectl apply -f config.yaml`.
 
 {{% notice note %}}
 If you installed MetalLB with Helm, you will need to change the
-namespace of the ConfigMap to match the namespace in which MetalLB was
-deployed, and change the ConfigMap's name from `config` to
-`metallb-config`.
+namespace of the config map to match the namespace in which MetalLB was
+deployed, and change the name of the config map from `config` to
+`metallb`.
 {{% /notice %}}
 
 The specific configuration depends on the protocol(s) you want to use
@@ -55,6 +55,23 @@ data:
       - 192.168.1.240-192.168.1.250
 ```
 
+{{% notice note %}}
+If you installed MetalLB with the `MetalLB Operator`, the addresspool configuration happens via the `AddressPool` CRD:
+
+```yaml
+apiVersion: metallb.io/v1beta1
+kind: AddressPool
+metadata:
+  name: addresspool-sample1
+  namespace: metallb-system
+spec:
+  protocol: layer2
+  addresses:
+    - 172.18.0.100-172.18.0.255
+```
+
+{{% /notice %}}
+
 ## BGP configuration
 
 For a basic configuration featuring one BGP router and one IP address
@@ -86,6 +103,58 @@ data:
       protocol: bgp
       addresses:
       - 192.168.10.0/24
+```
+
+{{% notice note %}}
+If you installed MetalLB with the `MetalLB Operator`, the peers configuration happens via the `BGPPeer` CRD:
+
+```yaml
+apiVersion: metallb.io/v1beta1
+kind: BGPPeer
+metadata:
+  name: peer-sample1
+  namespace: metallb-system
+spec:
+  peerAddress: 10.0.0.1
+  peerASN: 64501
+  myASN: 64500
+  routerID: 10.10.10.10
+  peerPort: 1
+  holdTime: "180s"
+  keepaliveTime: "180s"
+  sourceAddress: "1.1.1.1"
+  password: "test"
+  nodeSelectors:
+  - matchExpressions:
+    - key: kubernetes.io/hostname
+      operator: In
+      values: [hostA, hostB]
+```
+
+{{% /notice %}}
+
+### Enabling BFD support for BGP sessions
+
+With the experimental FRR mode, BGP sessions can be backed up by BFD sessions in order to provide a quicker path failure detection than BGP alone provides.
+
+In order to enable BFD, a BFD profile must be added and referenced by a given peer:
+
+```yaml
+    peers:
+    - my-asn: 64512
+      peer-asn: 64513
+      peer-address: 172.18.0.7
+      peer-port: 179
+      bfd-profile: full1
+    bfd-profiles:
+    - name: full1
+      receive-interval: 179
+      transmit-interval: 180
+      echo-interval: 62
+      echo-mode: false
+      passive-mode: false
+      minimum-ttl: 254
+
 ```
 
 ### Advertisement configuration
@@ -232,6 +301,48 @@ peers:
       values: [hostA, hostB]
 ```
 
+### Configuring the BGP source address
+
+When a host has multiple network interfaces or multiple IP addresses
+configured on one interface, the host's TCP/IP stack usually selects
+the IP address that is used as the source IP address for outbound
+connections automatically. This is true also for BGP connections.
+
+Sometimes, the automatically-selected address may not be the desired
+one for some reason. In such cases, MetalLB supports explicitly
+specifying the source address to be used when establishing a BGP
+session:
+
+```yaml
+peers:
+- peer-address: 10.0.0.1
+  peer-asn: 64501
+  my-asn: 64500
+  source-address: 10.0.0.2
+  node-selectors:
+  - match-labels:
+      kubernetes.io/hostname: node-1
+```
+
+The configuration above tells the MetalLB speaker to check if the
+address `10.0.0.2` exists locally on one of the host's network
+interfaces, and if so - to use it as the source address when
+establishing BGP sessions. If the address isn't found, the default
+behavior takes place (that is, the kernel selects the source address
+automatically).
+
+{{% notice warning %}}
+In most cases the `source-address` field should only be used with
+**per-node peers**, i.e. peers with node selectors which select only
+one node.
+
+By default, a BGP peer configured under the `peers` configuration
+section runs on **all** speaker nodes. It is likely meaningless to use
+the `source-address` field in a peer configuration that applies to
+more than one node because two nodes in a given network usually
+shouldn't have the same IP address.
+{{% /notice %}}
+
 ## Advanced address pool configuration
 
 ### Controlling automatic address allocation
@@ -280,3 +391,9 @@ misguided
 If you encounter this issue with your users or networks, you can set
 `avoid-buggy-ips: true` on an address pool to mark `.0` and `.255`
 addresses as unusable.
+
+## Configuring via the MetalLB Operator
+
+The MetalLB Operator allows to configure MetalLB via CRDs.
+
+The CRDs are mapped to the current MetalLB ConfigMap structure.

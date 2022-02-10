@@ -20,11 +20,11 @@ manifests, using Kustomize, or using Helm.
 
 If you're using kube-proxy in IPVS mode, since Kubernetes v1.14.2 you have to enable strict ARP mode.
 
-*Note, you don't need this if you're using kube-router as service-proxy because it is enabling strict arp by default.*
+*Note, you don't need this if you're using kube-router as service-proxy because it is enabling strict ARP by default.*
 
 You can achieve this by editing kube-proxy config in current cluster:
 
-```shell
+```bash
 kubectl edit configmap -n kube-system kube-proxy
 ```
 
@@ -42,7 +42,7 @@ You can also add this configuration snippet to your kubeadm-config, just append 
 
 If you are trying to automate this change, these shell snippets may help you:
 
-```shell
+```bash
 # see what changes would be made, returns nonzero returncode if different
 kubectl get configmap kube-proxy -n kube-system -o yaml | \
 sed -e "s/strictARP: false/strictARP: true/" | \
@@ -58,10 +58,22 @@ kubectl apply -f - -n kube-system
 
 To install MetalLB, apply the manifest:
 
-```shell
+```bash
 kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/main/manifests/namespace.yaml
 kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/main/manifests/metallb.yaml
 ```
+
+{{% notice note %}}
+If you want to deploy MetalLB using the [experimental FRR mode](https://metallb.universe.tf/configuration/#enabling-bfd-support-for-bgp-sessions), apply the manifests:
+
+```bash
+kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/main/manifests/namespace.yaml
+kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/main/manifests/metallb-frr.yaml
+```
+
+Please do note that these manifests deploy MetalLB from the main development branch. We highly encourage cloud operators to deploy a stable released version of MetalLB on production environments!
+
+{{% /notice %}}
 
 This will deploy MetalLB to your cluster, under the `metallb-system`
 namespace. The components in the manifest are:
@@ -83,31 +95,33 @@ you
 ## Installation with kustomize
 
 You can install MetalLB with
-[kustomize](https://github.com/kubernetes-sigs/kustomize) by pointing
-on the remote kustomization fle :
+[Kustomize](https://github.com/kubernetes-sigs/kustomize) by pointing
+at the remote kustomization file.
+
+In the following example, we are deploying the v0.11.0 version of MetalLB :
 
 ```yaml
 # kustomization.yml
 namespace: metallb-system
 
 resources:
-  - github.com/metallb/metallb//manifests?ref=v0.9.3
+  - github.com/metallb/metallb/manifests?ref=v0.11.0
   - configmap.yml 
 ```
 
 If you want to use a
 [configMapGenerator](https://github.com/kubernetes-sigs/kustomize/blob/master/examples/configGeneration.md)
-for config file, you want to tell kustomize not to append a hash to
-the configMap, as MetalLB is waiting for a configMap named `config`
+for config file, you want to tell Kustomize not to append a hash to
+the config map, as MetalLB is waiting for a config map named `config`
 (see
-[https://github.com/kubernetes-sigs/kustomize/blob/master/examples/generatorOptions.md](https://github.com/kubernetes-sigs/kustomize/blob/master/examples/generatorOptions.md)):
+<https://github.com/kubernetes-sigs/kustomize/blob/master/examples/generatorOptions.md>):
 
-```
+```yaml
 # kustomization.yml
 namespace: metallb-system
 
 resources:
-  - github.com/metallb/metallb//manifests?ref=v0.9.3
+  - github.com/metallb/metallb//manifests?ref=v0.11.0
 
 configMapGenerator:
 - name: config
@@ -120,20 +134,22 @@ generatorOptions:
 
 ## Installation with Helm
 
-You can install MetallLB with [helm](https://helm.sh/)
-by using the helm chart repository: https://metallb.github.io/metallb
+You can install MetallLB with [Helm](https://helm.sh/)
+by using the Helm chart repository: `https://metallb.github.io/metallb`
 
-```yaml
+```bash
 helm repo add metallb https://metallb.github.io/metallb
 helm install metallb metallb/metallb
 ```
 
-A values file may be specified on installation. This is recommended for providing configs in helm values:
-```yaml
+A values file may be specified on installation. This is recommended for providing configs in Helm values:
+
+```bash
 helm install metallb metallb/metallb -f values.yaml
 ```
 
-MetalLB configs are set in values.yaml under `configInLine`:
+MetalLB configs are set in `values.yaml` under `configInLine`:
+
 ```yaml
 configInline:
   address-pools:
@@ -143,6 +159,50 @@ configInline:
      - 198.51.100.0/24
 ```
 
+{{% notice note %}}
+If you want to deploy MetalLB using the [experimental FRR mode](https://metallb.universe.tf/configuration/#enabling-bfd-support-for-bgp-sessions), the following value must be set:
+
+```yaml
+speaker:
+  frr:
+    enabled: true
+```
+
+{{% /notice %}}
+
+## Using the MetalLB Operator
+
+The MetalLB Operator is available on OperatorHub at [operatorhub.io/operator/metallb-operator](https://operatorhub.io/operator/metallb-operator). It eases the deployment and life-cycle of MetalLB in a cluster and allows configuring MetalLB via CRDs.
+
+{{% notice note %}}
+If you want to deploy MetalLB using the [experimental FRR mode](https://metallb.universe.tf/configuration/#enabling-bfd-support-for-bgp-sessions), you must edit the ClusterServiceVersion resource
+named `metallb-operator`:
+
+```bash
+kubectl edit csv metallb-operator
+```
+
+and change the `BGP_TYPE` environment variable of the `manager` container to `frr`:
+
+```yaml
+- name: METALLB_BGP_TYPE
+  value: frr
+```
+
+## FRR daemons logging level
+
+The FRR daemons logging level are configured using the speaker `--log-level` argument following the below mapping:
+
+Speaker log level | FRR log level
+------------------|--------------
+all, debug        | debugging
+info              | informational
+warn              | warnings
+error             | error
+none              | emergencies
+
+To override this behavior, you can set the `FRR_LOGGING_LEVEL` speaker's environment to any [FRR supported value](https://docs.frrouting.org/en/latest/basic.html#clicmd-log-stdout-LEVEL).
+
 ## Upgrade
 
 When upgrading MetalLB, always check the [release notes](https://metallb.universe.tf/release-notes/)
@@ -150,10 +210,9 @@ to see the changes and required actions, if any. Pay special attention to the re
 upgrading to newer major/minor releases.
 
 Unless specified otherwise in the release notes, upgrade MetalLB either using
-[plain manifests](#installation-by-manifest) or using [kustomize](#installation-with-kustomize) as
+[plain manifests](#installation-by-manifest) or using [Kustomize](#installation-with-kustomize) as
 described above.
 
 Please take the known limitations for [layer2](https://metallb.universe.tf/concepts/layer2/#limitations)
 and [bgp](https://metallb.universe.tf/concepts/bgp/#limitations) into account when performing an
 upgrade.
-=======

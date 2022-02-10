@@ -1,3 +1,5 @@
+// SPDX-License-Identifier:Apache-2.0
+
 package main
 
 import (
@@ -44,14 +46,14 @@ func ipnet(s string) *net.IPNet {
 	return n
 }
 
-func statusAssigned(ip string) v1.ServiceStatus {
+func statusAssigned(ips []string) v1.ServiceStatus {
+	lbIngressIPs := []v1.LoadBalancerIngress{}
+	for _, ip := range ips {
+		lbIngressIPs = append(lbIngressIPs, v1.LoadBalancerIngress{IP: ip})
+	}
 	return v1.ServiceStatus{
 		LoadBalancer: v1.LoadBalancerStatus{
-			Ingress: []v1.LoadBalancerIngress{
-				{
-					IP: ip,
-				},
-			},
+			Ingress: lbIngressIPs,
 		},
 	}
 }
@@ -131,6 +133,11 @@ func TestControllerMutation(t *testing.T) {
 				AutoAssign: false,
 				CIDR:       []*net.IPNet{ipnet("2000::1/128")},
 			},
+			"pool5": {
+				Protocol:   config.BGP,
+				AutoAssign: true,
+				CIDR:       []*net.IPNet{ipnet("1.2.3.0/31"), ipnet("1000::/127")},
+			},
 		},
 	}
 
@@ -161,8 +168,8 @@ func TestControllerMutation(t *testing.T) {
 			desc: "simple non-LoadBalancer",
 			in: &v1.Service{
 				Spec: v1.ServiceSpec{
-					Type:      "ClusterIP",
-					ClusterIP: "1.2.3.4",
+					Type:       "ClusterIP",
+					ClusterIPs: []string{"1.2.3.4"},
 				},
 			},
 		},
@@ -171,16 +178,16 @@ func TestControllerMutation(t *testing.T) {
 			desc: "simple LoadBalancer",
 			in: &v1.Service{
 				Spec: v1.ServiceSpec{
-					Type:      "LoadBalancer",
-					ClusterIP: "1.2.3.4",
+					Type:       "LoadBalancer",
+					ClusterIPs: []string{"1.2.3.4"},
 				},
 			},
 			want: &v1.Service{
 				Spec: v1.ServiceSpec{
-					ClusterIP: "1.2.3.4",
-					Type:      "LoadBalancer",
+					ClusterIPs: []string{"1.2.3.4"},
+					Type:       "LoadBalancer",
 				},
-				Status: statusAssigned("1.2.3.0"),
+				Status: statusAssigned([]string{"1.2.3.0"}),
 			},
 		},
 
@@ -188,19 +195,63 @@ func TestControllerMutation(t *testing.T) {
 			desc: "request specific IP",
 			in: &v1.Service{
 				Spec: v1.ServiceSpec{
-					ClusterIP:      "1.2.3.4",
+					ClusterIPs:     []string{"1.2.3.4"},
 					Type:           "LoadBalancer",
 					LoadBalancerIP: "1.2.3.1",
 				},
 			},
 			want: &v1.Service{
 				Spec: v1.ServiceSpec{
-					ClusterIP:      "1.2.3.4",
+					ClusterIPs:     []string{"1.2.3.4"},
 					Type:           "LoadBalancer",
 					LoadBalancerIP: "1.2.3.1",
 				},
-				Status: statusAssigned("1.2.3.1"),
+				Status: statusAssigned([]string{"1.2.3.1"}),
 			},
+		},
+
+		{
+			desc: "request specific IP via custom annotation",
+			in: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						annotationLoadBalancerIPs: "1.2.3.1",
+					},
+				},
+				Spec: v1.ServiceSpec{
+					ClusterIPs: []string{"1.2.3.4"},
+					Type:       "LoadBalancer",
+				},
+			},
+			want: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						annotationLoadBalancerIPs: "1.2.3.1",
+					},
+				},
+				Spec: v1.ServiceSpec{
+					ClusterIPs: []string{"1.2.3.4"},
+					Type:       "LoadBalancer",
+				},
+				Status: statusAssigned([]string{"1.2.3.1"}),
+			},
+		},
+
+		{
+			desc: "request IP from both svc.spec.LoadBalancerIP and custom annotation",
+			in: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						annotationLoadBalancerIPs: "1.2.3.1",
+					},
+				},
+				Spec: v1.ServiceSpec{
+					ClusterIPs:     []string{"1.2.3.4"},
+					Type:           "LoadBalancer",
+					LoadBalancerIP: "1.2.3.2",
+				},
+			},
+			wantErr: true,
 		},
 
 		{
@@ -209,7 +260,39 @@ func TestControllerMutation(t *testing.T) {
 				Spec: v1.ServiceSpec{
 					Type:           "LoadBalancer",
 					LoadBalancerIP: "please sir may I have an IP address thank you",
-					ClusterIP:      "1.2.3.4",
+					ClusterIPs:     []string{"1.2.3.4"},
+				},
+			},
+			wantErr: true,
+		},
+
+		{
+			desc: "request invalid IP via custom annotation",
+			in: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						annotationLoadBalancerIPs: "please sir may I have an IP address thank you",
+					},
+				},
+				Spec: v1.ServiceSpec{
+					ClusterIPs: []string{"1.2.3.4"},
+					Type:       "LoadBalancer",
+				},
+			},
+			wantErr: true,
+		},
+
+		{
+			desc: "request two IPs from same ip family via custom annotation",
+			in: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						annotationLoadBalancerIPs: "1.2.3.1,1.2.3.2",
+					},
+				},
+				Spec: v1.ServiceSpec{
+					ClusterIPs: []string{"1.2.3.4"},
+					Type:       "LoadBalancer",
 				},
 			},
 			wantErr: true,
@@ -221,15 +304,15 @@ func TestControllerMutation(t *testing.T) {
 				Spec: v1.ServiceSpec{
 					Type:           "LoadBalancer",
 					LoadBalancerIP: "1.2.3.4",
-					ClusterIP:      "1.2.3.4",
+					ClusterIPs:     []string{"1.2.3.4"},
 				},
-				Status: statusAssigned("1.2.3.1"),
+				Status: statusAssigned([]string{"1.2.3.1"}),
 			},
 			want: &v1.Service{
 				Spec: v1.ServiceSpec{
 					Type:           "LoadBalancer",
 					LoadBalancerIP: "1.2.3.4",
-					ClusterIP:      "1.2.3.4",
+					ClusterIPs:     []string{"1.2.3.4"},
 				},
 			},
 			wantErr: true,
@@ -244,8 +327,8 @@ func TestControllerMutation(t *testing.T) {
 					},
 				},
 				Spec: v1.ServiceSpec{
-					Type:      "LoadBalancer",
-					ClusterIP: "1.2.3.4",
+					Type:       "LoadBalancer",
+					ClusterIPs: []string{"1.2.3.4"},
 				},
 			},
 			want: &v1.Service{
@@ -255,10 +338,10 @@ func TestControllerMutation(t *testing.T) {
 					},
 				},
 				Spec: v1.ServiceSpec{
-					Type:      "LoadBalancer",
-					ClusterIP: "1.2.3.4",
+					Type:       "LoadBalancer",
+					ClusterIPs: []string{"1.2.3.4"},
 				},
-				Status: statusAssigned("1.2.3.0"),
+				Status: statusAssigned([]string{"1.2.3.0"}),
 			},
 		},
 
@@ -271,10 +354,10 @@ func TestControllerMutation(t *testing.T) {
 					},
 				},
 				Spec: v1.ServiceSpec{
-					ClusterIP: "1.2.3.4",
-					Type:      "LoadBalancer",
+					ClusterIPs: []string{"1.2.3.4"},
+					Type:       "LoadBalancer",
 				},
-				Status: statusAssigned("1.2.3.0"),
+				Status: statusAssigned([]string{"1.2.3.0"}),
 			},
 			want: &v1.Service{
 				ObjectMeta: metav1.ObjectMeta{
@@ -283,10 +366,10 @@ func TestControllerMutation(t *testing.T) {
 					},
 				},
 				Spec: v1.ServiceSpec{
-					ClusterIP: "1.2.3.4",
-					Type:      "LoadBalancer",
+					ClusterIPs: []string{"1.2.3.4"},
+					Type:       "LoadBalancer",
 				},
-				Status: statusAssigned("3.4.5.6"),
+				Status: statusAssigned([]string{"3.4.5.6"}),
 			},
 		},
 
@@ -299,8 +382,8 @@ func TestControllerMutation(t *testing.T) {
 					},
 				},
 				Spec: v1.ServiceSpec{
-					ClusterIP: "1.2.3.4",
-					Type:      "LoadBalancer",
+					ClusterIPs: []string{"1.2.3.4"},
+					Type:       "LoadBalancer",
 				},
 			},
 			wantErr: true,
@@ -310,17 +393,17 @@ func TestControllerMutation(t *testing.T) {
 			desc: "invalid IP assigned",
 			in: &v1.Service{
 				Spec: v1.ServiceSpec{
-					Type:      "LoadBalancer",
-					ClusterIP: "1.2.3.4",
+					Type:       "LoadBalancer",
+					ClusterIPs: []string{"1.2.3.4"},
 				},
-				Status: statusAssigned("2.3.4.5"),
+				Status: statusAssigned([]string{"2.3.4.5"}),
 			},
 			want: &v1.Service{
 				Spec: v1.ServiceSpec{
-					Type:      "LoadBalancer",
-					ClusterIP: "1.2.3.4",
+					Type:       "LoadBalancer",
+					ClusterIPs: []string{"1.2.3.4"},
 				},
-				Status: statusAssigned("1.2.3.0"),
+				Status: statusAssigned([]string{"1.2.3.0"}),
 			},
 		},
 
@@ -328,8 +411,8 @@ func TestControllerMutation(t *testing.T) {
 			desc: "invalid ingress state",
 			in: &v1.Service{
 				Spec: v1.ServiceSpec{
-					Type:      "LoadBalancer",
-					ClusterIP: "1.2.3.4",
+					Type:       "LoadBalancer",
+					ClusterIPs: []string{"1.2.3.4"},
 				},
 				Status: v1.ServiceStatus{
 					LoadBalancer: v1.LoadBalancerStatus{
@@ -346,10 +429,10 @@ func TestControllerMutation(t *testing.T) {
 			},
 			want: &v1.Service{
 				Spec: v1.ServiceSpec{
-					Type:      "LoadBalancer",
-					ClusterIP: "1.2.3.4",
+					Type:       "LoadBalancer",
+					ClusterIPs: []string{"1.2.3.4"},
 				},
-				Status: statusAssigned("1.2.3.0"),
+				Status: statusAssigned([]string{"1.2.3.0"}),
 			},
 		},
 
@@ -357,15 +440,15 @@ func TestControllerMutation(t *testing.T) {
 			desc: "former LoadBalancer, now NodePort",
 			in: &v1.Service{
 				Spec: v1.ServiceSpec{
-					Type:      "NodePort",
-					ClusterIP: "1.2.3.4",
+					Type:       "NodePort",
+					ClusterIPs: []string{"1.2.3.4"},
 				},
-				Status: statusAssigned("1.2.3.0"),
+				Status: statusAssigned([]string{"1.2.3.0"}),
 			},
 			want: &v1.Service{
 				Spec: v1.ServiceSpec{
-					Type:      "NodePort",
-					ClusterIP: "1.2.3.4",
+					Type:       "NodePort",
+					ClusterIPs: []string{"1.2.3.4"},
 				},
 			},
 		},
@@ -376,16 +459,16 @@ func TestControllerMutation(t *testing.T) {
 				Spec: v1.ServiceSpec{
 					Type:           "LoadBalancer",
 					LoadBalancerIP: "3.4.5.6",
-					ClusterIP:      "1.2.3.4",
+					ClusterIPs:     []string{"1.2.3.4"},
 				},
 			},
 			want: &v1.Service{
 				Spec: v1.ServiceSpec{
 					Type:           "LoadBalancer",
 					LoadBalancerIP: "3.4.5.6",
-					ClusterIP:      "1.2.3.4",
+					ClusterIPs:     []string{"1.2.3.4"},
 				},
-				Status: statusAssigned("3.4.5.6"),
+				Status: statusAssigned([]string{"3.4.5.6"}),
 			},
 		},
 
@@ -396,7 +479,7 @@ func TestControllerMutation(t *testing.T) {
 					Type:                  "LoadBalancer",
 					LoadBalancerIP:        "3.4.5.6",
 					ExternalTrafficPolicy: "Local",
-					ClusterIP:             "1.2.3.4",
+					ClusterIPs:            []string{"1.2.3.4"},
 				},
 			},
 			want: &v1.Service{
@@ -404,9 +487,9 @@ func TestControllerMutation(t *testing.T) {
 					Type:                  "LoadBalancer",
 					LoadBalancerIP:        "3.4.5.6",
 					ExternalTrafficPolicy: "Local",
-					ClusterIP:             "1.2.3.4",
+					ClusterIPs:            []string{"1.2.3.4"},
 				},
-				Status: statusAssigned("3.4.5.6"),
+				Status: statusAssigned([]string{"3.4.5.6"}),
 			},
 		},
 
@@ -426,7 +509,23 @@ func TestControllerMutation(t *testing.T) {
 				Spec: v1.ServiceSpec{
 					Type:           "LoadBalancer",
 					LoadBalancerIP: "1.2.3.1",
-					ClusterIP:      "3000::1",
+					ClusterIPs:     []string{"3000::1"},
+				},
+			},
+			wantErr: true,
+		},
+
+		{
+			desc: "request IP from wrong ip-family (ipv4) via custom annotation",
+			in: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						annotationLoadBalancerIPs: "1.2.3.1",
+					},
+				},
+				Spec: v1.ServiceSpec{
+					ClusterIPs: []string{"3000::1"},
+					Type:       "LoadBalancer",
 				},
 			},
 			wantErr: true,
@@ -438,7 +537,23 @@ func TestControllerMutation(t *testing.T) {
 				Spec: v1.ServiceSpec{
 					Type:           "LoadBalancer",
 					LoadBalancerIP: "1000::",
-					ClusterIP:      "1.2.3.4",
+					ClusterIPs:     []string{"1.2.3.4"},
+				},
+			},
+			wantErr: true,
+		},
+
+		{
+			desc: "request IP from wrong ip-family (ipv6) via custom annotation",
+			in: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						annotationLoadBalancerIPs: "1000::",
+					},
+				},
+				Spec: v1.ServiceSpec{
+					ClusterIPs: []string{"1.2.3.4"},
+					Type:       "LoadBalancer",
 				},
 			},
 			wantErr: true,
@@ -448,17 +563,17 @@ func TestControllerMutation(t *testing.T) {
 			desc: "IP from wrong ip-family (ipv6) assigned",
 			in: &v1.Service{
 				Spec: v1.ServiceSpec{
-					Type:      "LoadBalancer",
-					ClusterIP: "1.2.3.4",
+					Type:       "LoadBalancer",
+					ClusterIPs: []string{"1.2.3.4"},
 				},
-				Status: statusAssigned("1000::"),
+				Status: statusAssigned([]string{"1000::"}),
 			},
 			want: &v1.Service{
 				Spec: v1.ServiceSpec{
-					Type:      "LoadBalancer",
-					ClusterIP: "1.2.3.4",
+					Type:       "LoadBalancer",
+					ClusterIPs: []string{"1.2.3.4"},
 				},
-				Status: statusAssigned("1.2.3.0"),
+				Status: statusAssigned([]string{"1.2.3.0"}),
 			},
 		},
 
@@ -466,17 +581,143 @@ func TestControllerMutation(t *testing.T) {
 			desc: "IP from wrong ip-family (ipv4) assigned",
 			in: &v1.Service{
 				Spec: v1.ServiceSpec{
-					Type:      "LoadBalancer",
-					ClusterIP: "3000::1",
+					Type:       "LoadBalancer",
+					ClusterIPs: []string{"3000::1"},
 				},
-				Status: statusAssigned("1.2.3.0"),
+				Status: statusAssigned([]string{"1.2.3.0"}),
 			},
 			want: &v1.Service{
 				Spec: v1.ServiceSpec{
-					Type:      "LoadBalancer",
-					ClusterIP: "3000::1",
+					Type:       "LoadBalancer",
+					ClusterIPs: []string{"3000::1"},
 				},
-				Status: statusAssigned("1000::"),
+				Status: statusAssigned([]string{"1000::"}),
+			},
+		},
+		// dual-stack test cases
+		{
+			desc: "deleted balancer",
+		},
+		{
+			desc: "simple dual-stack LoadBalancer",
+			in: &v1.Service{
+				Spec: v1.ServiceSpec{
+					Type:       "LoadBalancer",
+					ClusterIPs: []string{"1.2.3.4", "3000::1"},
+				},
+			},
+			want: &v1.Service{
+				Spec: v1.ServiceSpec{
+					ClusterIPs: []string{"1.2.3.4", "3000::1"},
+					Type:       "LoadBalancer",
+				},
+				Status: statusAssigned([]string{"1.2.3.0", "1000::"}),
+			},
+		},
+		{
+			desc: "request IPs from specific pool",
+			in: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						"metallb.universe.tf/address-pool": "pool5",
+					},
+				},
+				Spec: v1.ServiceSpec{
+					Type:       "LoadBalancer",
+					ClusterIPs: []string{"1.2.3.4", "3000::1"},
+				},
+			},
+			want: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						"metallb.universe.tf/address-pool": "pool5",
+					},
+				},
+				Spec: v1.ServiceSpec{
+					Type:       "LoadBalancer",
+					ClusterIPs: []string{"1.2.3.4", "3000::1"},
+				},
+				Status: statusAssigned([]string{"1.2.3.0", "1000::"}),
+			},
+		},
+		{
+			desc: "request specific loadbalancer IP with dual-stack",
+			in: &v1.Service{
+				Spec: v1.ServiceSpec{
+					ClusterIPs:     []string{"1.2.3.4", "3000::1"},
+					Type:           "LoadBalancer",
+					LoadBalancerIP: "1.2.3.1",
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "request specific loadbalancer IPv4 address via custom annotation for dual-stack config",
+			in: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						annotationLoadBalancerIPs: "1.2.3.1",
+					},
+				},
+				Spec: v1.ServiceSpec{
+					ClusterIPs: []string{"1.2.3.4", "3000::1"},
+					Type:       "LoadBalancer",
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "request dual-stack loadbalancer IPs via custom annotation",
+			in: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						annotationLoadBalancerIPs: "1.2.3.0,1000::",
+					},
+				},
+				Spec: v1.ServiceSpec{
+					ClusterIPs: []string{"1.2.3.4", "3000::1"},
+					Type:       "LoadBalancer",
+				},
+			},
+			want: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						annotationLoadBalancerIPs: "1.2.3.0,1000::",
+					},
+				},
+				Spec: v1.ServiceSpec{
+					Type:       "LoadBalancer",
+					ClusterIPs: []string{"1.2.3.4", "3000::1"},
+				},
+				Status: statusAssigned([]string{"1.2.3.0", "1000::"}),
+			},
+		},
+		{
+			desc: "request dual-stack loadbalancer with invalid ingress",
+			in: &v1.Service{
+				Spec: v1.ServiceSpec{
+					Type:       "LoadBalancer",
+					ClusterIPs: []string{"3000::1", "5.6.7.8"},
+				},
+				Status: v1.ServiceStatus{
+					LoadBalancer: v1.LoadBalancerStatus{
+						Ingress: []v1.LoadBalancerIngress{
+							{
+								Hostname: "foo.bar.local",
+							},
+							{
+								IP: "1000::",
+							},
+						},
+					},
+				},
+			},
+			want: &v1.Service{
+				Spec: v1.ServiceSpec{
+					Type:       "LoadBalancer",
+					ClusterIPs: []string{"3000::1", "5.6.7.8"},
+				},
+				Status: statusAssigned([]string{"1.2.3.0", "1000::"}),
 			},
 		},
 	}
@@ -507,13 +748,10 @@ func TestControllerMutation(t *testing.T) {
 				}
 			}
 
-			if test.want != nil && len(test.want.Status.LoadBalancer.Ingress) > 0 && test.want.Status.LoadBalancer.Ingress[0].IP != "" {
-				ip := net.ParseIP(test.want.Status.LoadBalancer.Ingress[0].IP)
-				if ip == nil {
+			if test.want != nil && len(test.want.Status.LoadBalancer.Ingress) > 0 {
+				ips := test.want.Status.LoadBalancer.Ingress
+				if len(ips) == 0 {
 					panic("bad wanted IP in loadbalancer status")
-				}
-				if !ip.Equal(c.ips.IP("test")) {
-					t.Errorf("%q: controller internal state does not match IP that controller claimed to allocate: want %q, got %q", test.desc, ip, c.ips.IP("test"))
 				}
 			}
 		}
@@ -545,8 +783,8 @@ func TestControllerConfig(t *testing.T) {
 	l := log.NewNopLogger()
 	svc := &v1.Service{
 		Spec: v1.ServiceSpec{
-			Type:      "LoadBalancer",
-			ClusterIP: "1.2.3.4",
+			Type:       "LoadBalancer",
+			ClusterIPs: []string{"1.2.3.4"},
 		},
 	}
 	if c.SetBalancer(l, "test", svc, k8s.EpsOrSlices{}) == k8s.SyncStateError {
@@ -613,7 +851,7 @@ func TestControllerConfig(t *testing.T) {
 	gotSvc = k.gotService(svc)
 	wantSvc := new(v1.Service)
 	*wantSvc = *svc
-	wantSvc.Status = statusAssigned("1.2.3.0")
+	wantSvc.Status = statusAssigned([]string{"1.2.3.0"})
 	if diff := diffService(wantSvc, gotSvc); diff != "" {
 		t.Errorf("SetBalancer produced unexpected mutation (-want +got)\n%s", diff)
 	}
@@ -624,7 +862,7 @@ func TestControllerConfig(t *testing.T) {
 	}
 
 	// Deleting the config also makes MetalLB sad.
-	if c.SetConfig(l, nil) != k8s.SyncStateError {
+	if c.SetConfig(l, nil) != k8s.SyncStateErrorNoRetry {
 		t.Fatalf("SetConfig that deletes the config was accepted")
 	}
 }
@@ -652,8 +890,8 @@ func TestDeleteRecyclesIP(t *testing.T) {
 
 	svc1 := &v1.Service{
 		Spec: v1.ServiceSpec{
-			Type:      "LoadBalancer",
-			ClusterIP: "1.2.3.4",
+			Type:       "LoadBalancer",
+			ClusterIPs: []string{"1.2.3.4"},
 		},
 	}
 	if c.SetBalancer(l, "test", svc1, k8s.EpsOrSlices{}) == k8s.SyncStateError {
@@ -672,8 +910,8 @@ func TestDeleteRecyclesIP(t *testing.T) {
 	// IP because we have none left.
 	svc2 := &v1.Service{
 		Spec: v1.ServiceSpec{
-			Type:      "LoadBalancer",
-			ClusterIP: "1.2.3.4",
+			Type:       "LoadBalancer",
+			ClusterIPs: []string{"1.2.3.4"},
 		},
 	}
 	if c.SetBalancer(l, "test2", svc2, k8s.EpsOrSlices{}) == k8s.SyncStateError {
@@ -699,5 +937,98 @@ func TestDeleteRecyclesIP(t *testing.T) {
 	}
 	if len(gotSvc.Status.LoadBalancer.Ingress) == 0 || gotSvc.Status.LoadBalancer.Ingress[0].IP != "1.2.3.0" {
 		t.Fatal("svc2 didn't get an IP")
+	}
+}
+func TestControllerDualStackConfig(t *testing.T) {
+	k := &testK8S{t: t}
+	c := &controller{
+		ips:    allocator.New(),
+		client: k,
+	}
+
+	l := log.NewNopLogger()
+	svc := &v1.Service{
+		Spec: v1.ServiceSpec{
+			Type:       "LoadBalancer",
+			ClusterIPs: []string{"1.2.3.4", "1000::"},
+		},
+	}
+	if c.SetBalancer(l, "test", svc, k8s.EpsOrSlices{}) == k8s.SyncStateError {
+		t.Fatalf("SetBalancer failed")
+	}
+
+	gotSvc := k.gotService(svc)
+	if gotSvc != nil {
+		t.Errorf("SetBalancer with no configuration mutated service (-in +out)\n%s", diffService(svc, gotSvc))
+	}
+	if k.loggedWarning {
+		t.Error("SetBalancer with no configuration logged an error")
+	}
+
+	// Set an empty config. Balancer should still not do anything to
+	// our unallocated service, and return an error to force a
+	// retry after sync is complete.
+	if c.SetConfig(l, &config.Config{}) == k8s.SyncStateError {
+		t.Fatalf("SetConfig with empty config failed")
+	}
+	if c.SetBalancer(l, "test", svc, k8s.EpsOrSlices{}) != k8s.SyncStateError {
+		t.Fatal("SetBalancer did not fail")
+	}
+
+	gotSvc = k.gotService(svc)
+	if gotSvc != nil {
+		t.Errorf("unsynced SetBalancer mutated service (-in +out)\n%s", diffService(svc, gotSvc))
+	}
+	if k.loggedWarning {
+		t.Error("unsynced SetBalancer logged an error")
+	}
+
+	// Set a config with some IPs. Still no allocation, not synced.
+	cfg := &config.Config{
+		Pools: map[string]*config.Pool{
+			"default": {
+				AutoAssign: true,
+				CIDR:       []*net.IPNet{ipnet("1.2.3.0/24"), ipnet("1000::1/127")},
+			},
+		},
+	}
+	if c.SetConfig(l, cfg) == k8s.SyncStateError {
+		t.Fatalf("SetConfig failed")
+	}
+	if c.SetBalancer(l, "test", svc, k8s.EpsOrSlices{}) != k8s.SyncStateError {
+		t.Fatal("SetBalancer did not fail")
+	}
+
+	gotSvc = k.gotService(svc)
+	if gotSvc != nil {
+		t.Errorf("unsynced SetBalancer mutated service (-in +out)\n%s", diffService(svc, gotSvc))
+	}
+	if k.loggedWarning {
+		t.Error("unsynced SetBalancer logged an error")
+	}
+
+	// Mark synced. Finally, we can allocate.
+	c.MarkSynced(l)
+
+	if c.SetBalancer(l, "test", svc, k8s.EpsOrSlices{}) == k8s.SyncStateError {
+		t.Fatalf("SetBalancer failed")
+	}
+
+	gotSvc = k.gotService(svc)
+	wantSvc := new(v1.Service)
+	*wantSvc = *svc
+	wantSvc.Status = statusAssigned([]string{"1.2.3.0", "1000::"})
+	if diff := diffService(wantSvc, gotSvc); diff != "" {
+		t.Errorf("SetBalancer produced unexpected mutation (-want +got)\n%s", diff)
+	}
+
+	// Now that an IP is allocated, removing the IP pool is not allowed.
+	if c.SetConfig(l, &config.Config{}) != k8s.SyncStateError {
+		t.Fatalf("SetConfig that deletes allocated IPs was accepted")
+	}
+
+	// Deleting the config also makes MetalLB sad.
+	if c.SetConfig(l, nil) != k8s.SyncStateErrorNoRetry {
+		t.Fatalf("SetConfig that deletes the config was accepted")
 	}
 }

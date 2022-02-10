@@ -3,7 +3,7 @@ title: Usage
 weight: 5
 ---
 
-Once MetalLB is installed and configured, to expose a service
+After MetalLB is installed and configured, to expose a service
 externally, simply create it with `spec.type` set to `LoadBalancer`,
 and MetalLB will do the rest.
 
@@ -19,6 +19,12 @@ by setting that parameter. If MetalLB does not own the requested
 address, or if the address is already in use by another service,
 assignment will fail and MetalLB will log a warning event visible in
 `kubectl describe service <service name>`.
+
+MetalLB supports `spec.loadBalancerIP` and a custom `metallb.universe.tf/loadBalancerIPs`
+annotation. The annotation also supports a comma separated list of IPs to be used in case of
+Dual Stack services.
+
+Please note that `spec.LoadBalancerIP` is planned to be deprecated in [k8s apis](https://github.com/kubernetes/kubernetes/pull/107235).
 
 MetalLB also supports requesting a specific address pool, if you want
 a certain kind of address but don't care which one exactly. To request
@@ -57,12 +63,12 @@ policy.
 #### "Cluster" traffic policy
 
 With the default `Cluster` traffic policy, `kube-proxy` on the node that
-received the traffic does load-balancing, and distributes the traffic to all the
+received the traffic does load balancing, and distributes the traffic to all the
 pods in your service.
 
 This policy results in uniform traffic distribution across all pods in
 the service. However, `kube-proxy` will obscure the source IP address
-of the connection when it does load-balancing, so your pod logs will
+of the connection when it does load balancing, so your pod logs will
 show that external traffic appears to be coming from the service's
 leader node.
 
@@ -92,12 +98,12 @@ identical.
 
 With the default `Cluster` traffic policy, every node in your cluster
 will attract traffic for the service IP. On each node, the traffic is
-subjected to a second layer of load-balancing (provided by
+subjected to a second layer of load balancing (provided by
 `kube-proxy`), which directs the traffic to individual pods.
 
 This policy results in uniform traffic distribution across all nodes
 in your cluster, and across all pods in your service. However, it
-results in two layers of load-balancing (one at the BGP router, one at
+results in two layers of load balancing (one at the BGP router, one at
 `kube-proxy` on the nodes), which can cause inefficient traffic
 flows. For example, a particular user's connection might be sent to
 node A by the BGP router, but then node A decides to send that
@@ -105,14 +111,14 @@ connection to a pod running on node B.
 
 The other downside of the "Cluster" policy is that `kube-proxy` will
 obscure the source IP address of the connection when it does its
-load-balancing, so your pod logs will show that external traffic
+load balancing, so your pod logs will show that external traffic
 appears to be coming from your cluster's nodes.
 
 #### "Local" traffic policy
 
 With the `Local` traffic policy, nodes will only attract traffic if
 they are running one or more of the service's pods locally. The BGP
-routers will load-balance incoming traffic only across those nodes
+routers will load balance incoming traffic only across those nodes
 that are currently hosting the service. On each node, the traffic is
 forwarded only to local pods by `kube-proxy`, there is no "horizontal"
 traffic flow between nodes.
@@ -123,7 +129,7 @@ traffic between cluster nodes, your pods can see the real source IP
 address of incoming connections.
 
 The downside of this policy is that it treats each cluster node as one
-"unit" of load-balancing, regardless of how many of the service's pods
+"unit" of load balancing, regardless of how many of the service's pods
 are running on that node. This may result in traffic imbalances to
 your pods.
 
@@ -149,6 +155,20 @@ announcements. See
 [issue 1](https://github.com/metallb/metallb/issues/1) for more
 information.
 
+## IPv6 and dual stack services
+
+IPv6 and dual stack services are supported in L2 mode, and in BGP mode only
+via the experimental FRR mode.
+
+In order for MetalLB to allocate IPs to a dual stack service, there must be
+at least one address pool having both addresses of version v4 and v6.
+
+Note that in case of dual stack services, it is not possible to use
+`spec.loadBalancerIP` as it does not allow to request for multiple IPs.
+
+This problem will be solved by using a custom service annotation in one
+of the next releases.
+
 ## IP address sharing
 
 By default, Services do not share IP addresses. If you have a need to
@@ -173,6 +193,46 @@ functionality described above.
 There are two main reasons to colocate services in this fashion: to
 work around a Kubernetes limitation, and to work with limited IP
 addresses.
+
+Here is an example configuration of two services that share the same ip address:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: dns-service-tcp
+  namespace: default
+  annotations:
+    metallb.universe.tf/allow-shared-ip: "key-to-share-1.2.3.4"
+spec:
+  type: LoadBalancer
+  loadBalancerIP: 1.2.3.4
+  ports:
+    - name: dnstcp
+      protocol: TCP
+      port: 53
+      targetPort: 53
+  selector:
+    app: dns
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dns-service-udp
+  namespace: default
+  annotations:
+    metallb.universe.tf/allow-shared-ip: "key-to-share-1.2.3.4"
+spec:
+  type: LoadBalancer
+  loadBalancerIP: 1.2.3.4
+  ports:
+    - name: dnsudp
+      protocol: UDP
+      port: 53
+      targetPort: 53
+  selector:
+    app: dns
+```
 
 [Kubernetes does not currently allow multiprotocol LoadBalancer services](https://github.com/kubernetes/kubernetes/issues/23880). This
 would normally make it impossible to run services like DNS, because

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier:Apache-2.0
+
 // Package logging sets up structured logging in a uniform way, and
 // redirects glog statements into the structured log.
 package logging
@@ -9,11 +11,38 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
 	"k8s.io/klog"
 )
+
+const (
+	LevelAll   = "all"
+	LevelDebug = "debug"
+	LevelInfo  = "info"
+	LevelWarn  = "warn"
+	LevelError = "error"
+	LevelNone  = "none"
+)
+
+type Level string
+type levelSlice []Level
+
+var (
+	// Levels returns an array of valid log levels.
+	Levels = levelSlice{LevelAll, LevelDebug, LevelInfo, LevelWarn, LevelError, LevelNone}
+)
+
+func (l levelSlice) String() string {
+	strs := make([]string, len(l))
+	for i, v := range l {
+		strs[i] = string(v)
+	}
+	return strings.Join(strs, ", ")
+}
 
 // Init returns a logger configured with common settings like
 // timestamping and source code locations. Both the stdlib logger and
@@ -22,7 +51,7 @@ import (
 // Init must be called as early as possible in main(), before any
 // application-specific flag parsing or logging occurs, because it
 // mutates the contents of the flag package as well as os.Stderr.
-func Init() (log.Logger, error) {
+func Init(lvl string) (log.Logger, error) {
 	l := log.NewJSONLogger(log.NewSyncWriter(os.Stdout))
 
 	r, w, err := os.Pipe()
@@ -33,7 +62,12 @@ func Init() (log.Logger, error) {
 	klog.SetOutput(w)
 	go collectGlogs(r, l)
 
-	return log.With(l, "ts", log.DefaultTimestampUTC, "caller", log.DefaultCaller), nil
+	opt, err := parseLevel(lvl)
+	if err != nil {
+		return nil, err
+	}
+
+	return level.NewFilter(log.With(l, "ts", log.DefaultTimestampUTC, "caller", log.DefaultCaller), opt), nil
 }
 
 func collectGlogs(f *os.File, logger log.Logger) {
@@ -57,16 +91,16 @@ func collectGlogs(f *os.File, logger log.Logger) {
 			buf = append(buf, l...)
 		}
 
-		level, ts, caller, msg := deformat(buf)
-		logger.Log("ts", ts.Format(time.RFC3339Nano), "level", level, "caller", caller, "msg", msg)
+		leveledLogger, ts, caller, msg := deformat(logger, buf)
+		leveledLogger.Log("ts", ts.Format(time.RFC3339Nano), "caller", caller, "msg", msg)
 	}
 }
 
 var logPrefix = regexp.MustCompile(`^(.)(\d{2})(\d{2}) (\d{2}):(\d{2}):(\d{2}).(\d{6})\s+\d+ ([^:]+:\d+)] (.*)$`)
 
-func deformat(b []byte) (level string, ts time.Time, caller, msg string) {
+func deformat(logger log.Logger, b []byte) (leveledLogger log.Logger, ts time.Time, caller, msg string) {
 	// Default deconstruction used when anything goes wrong.
-	level = "info"
+	leveledLogger = level.Info(logger)
 	ts = time.Now()
 	caller = ""
 	msg = string(b)
@@ -108,15 +142,34 @@ func deformat(b []byte) (level string, ts time.Time, caller, msg string) {
 
 	switch ms[1][0] {
 	case 'I':
-		level = "info"
+		leveledLogger = level.Info(logger)
 	case 'W':
-		level = "warn"
+		leveledLogger = level.Warn(logger)
 	case 'E', 'F':
-		level = "error"
+		leveledLogger = level.Error(logger)
 	}
 
 	caller = string(ms[8])
 	msg = string(ms[9])
 
 	return
+}
+
+func parseLevel(lvl string) (level.Option, error) {
+	switch lvl {
+	case LevelAll:
+		return level.AllowAll(), nil
+	case LevelDebug:
+		return level.AllowDebug(), nil
+	case LevelInfo:
+		return level.AllowInfo(), nil
+	case LevelWarn:
+		return level.AllowWarn(), nil
+	case LevelError:
+		return level.AllowError(), nil
+	case LevelNone:
+		return level.AllowNone(), nil
+	}
+
+	return nil, fmt.Errorf("failed to parse log level: %s", lvl)
 }

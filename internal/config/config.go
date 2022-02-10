@@ -15,7 +15,7 @@
 package config // import "go.universe.tf/metallb/internal/config"
 
 import (
-	"errors"
+	"bytes"
 	"fmt"
 	"net"
 	"reflect"
@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/mikioh/ipaddr"
+	"github.com/pkg/errors"
 	yaml "gopkg.in/yaml.v2"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -35,17 +36,22 @@ type configFile struct {
 	Peers          []peer
 	BGPCommunities map[string]string `yaml:"bgp-communities"`
 	Pools          []addressPool     `yaml:"address-pools"`
+	BFDProfiles    []bfdProfile      `yaml:"bfd-profiles"`
 }
 
 type peer struct {
 	MyASN         uint32         `yaml:"my-asn"`
 	ASN           uint32         `yaml:"peer-asn"`
 	Addr          string         `yaml:"peer-address"`
+	SrcAddr       string         `yaml:"source-address"`
 	Port          uint16         `yaml:"peer-port"`
 	HoldTime      string         `yaml:"hold-time"`
+	KeepaliveTime string         `yaml:"keepalive-time"`
 	RouterID      string         `yaml:"router-id"`
 	NodeSelectors []nodeSelector `yaml:"node-selectors"`
 	Password      string         `yaml:"password"`
+	BFDProfile    string         `yaml:"bfd-profile"`
+	EBGPMultiHop  bool           `yaml:"ebgp-multihop"`
 }
 
 type nodeSelector struct {
@@ -69,9 +75,21 @@ type addressPool struct {
 }
 
 type bgpAdvertisement struct {
-	AggregationLength *int `yaml:"aggregation-length"`
-	LocalPref         *uint32
-	Communities       []string
+	AggregationLength   *int `yaml:"aggregation-length"`
+	AggregationLengthV6 *int `yaml:"aggregation-length-v6"`
+	LocalPref           *uint32
+	Communities         []string
+}
+
+type bfdProfile struct {
+	Name             string  `yaml:"name"`
+	ReceiveInterval  *uint32 `yaml:"receive-interval"`
+	TransmitInterval *uint32 `yaml:"transmit-interval"`
+	DetectMultiplier *uint32 `yaml:"detect-multiplier"`
+	EchoInterval     *uint32 `yaml:"echo-interval"`
+	EchoMode         bool    `yaml:"echo-mode"`
+	PassiveMode      bool    `yaml:"passive-mode"`
+	MinimumTTL       *uint32 `yaml:"minimum-ttl"`
 }
 
 // Config is a parsed MetalLB configuration.
@@ -80,6 +98,8 @@ type Config struct {
 	Peers []*Peer
 	// Address pools from which to allocate load balancer IPs.
 	Pools map[string]*Pool
+	// BFD profiles that can be used by peers.
+	BFDProfiles map[string]*BFDProfile
 }
 
 // Proto holds the protocol we are speaking.
@@ -99,10 +119,14 @@ type Peer struct {
 	ASN uint32
 	// Address to dial when establishing the session.
 	Addr net.IP
+	// Source address to use when establishing the session.
+	SrcAddr net.IP
 	// Port to dial when establishing the session.
 	Port uint16
 	// Requested BGP hold time, per RFC4271.
 	HoldTime time.Duration
+	// Requested BGP keepalive time, per RFC4271.
+	KeepaliveTime time.Duration
 	// BGP router ID to advertise to the peer
 	RouterID net.IP
 	// Only connect to this peer on nodes that match one of these
@@ -110,6 +134,10 @@ type Peer struct {
 	NodeSelectors []labels.Selector
 	// Authentication password for routers enforcing TCP MD5 authenticated sessions
 	Password string
+	// The optional BFD profile to be used for this BGP session
+	BFDProfile string
+	// Optional ebgp peer is multi-hops away.
+	EBGPMultiHop bool
 	// TODO: more BGP session settings
 }
 
@@ -141,11 +169,26 @@ type BGPAdvertisement struct {
 	// length. Optional, defaults to 32 (i.e. no aggregation) if not
 	// specified.
 	AggregationLength int
+	// Optional, defaults to 128 (i.e. no aggregation) if not
+	// specified.
+	AggregationLengthV6 int
 	// Value of the LOCAL_PREF BGP path attribute. Used only when
 	// advertising to IBGP peers (i.e. Peer.MyASN == Peer.ASN).
 	LocalPref uint32
 	// Value of the COMMUNITIES path attribute.
 	Communities map[uint32]bool
+}
+
+// BFDProfile describes a BFD profile to be applied to a set of peers.
+type BFDProfile struct {
+	Name             string
+	ReceiveInterval  *uint32
+	TransmitInterval *uint32
+	DetectMultiplier *uint32
+	EchoInterval     *uint32
+	EchoMode         bool
+	PassiveMode      bool
+	MinimumTTL       *uint32
 }
 
 func parseNodeSelector(ns *nodeSelector) (labels.Selector, error) {
@@ -188,18 +231,56 @@ func parseHoldTime(ht string) (time.Duration, error) {
 	return rounded, nil
 }
 
+func parseKeepaliveTime(ht time.Duration, ka string) (time.Duration, error) {
+	// If keepalive time not set lets use 1/3 of holdtime.
+	if ka == "" {
+		return ht / 3, nil
+	}
+	d, err := time.ParseDuration(ka)
+	if err != nil {
+		return 0, fmt.Errorf("invalid keepalive time %q: %s", ka, err)
+	}
+	rounded := time.Duration(int(d.Seconds())) * time.Second
+	return rounded, nil
+}
+
 // Parse loads and validates a Config from bs.
-func Parse(bs []byte) (*Config, error) {
+func Parse(bs []byte, validate Validate) (*Config, error) {
 	var raw configFile
 	if err := yaml.UnmarshalStrict(bs, &raw); err != nil {
 		return nil, fmt.Errorf("could not parse config: %s", err)
 	}
 
-	cfg := &Config{Pools: map[string]*Pool{}}
+	err := validate(&raw)
+	if err != nil {
+		return nil, err
+	}
+
+	cfg := &Config{
+		Pools:       map[string]*Pool{},
+		BFDProfiles: map[string]*BFDProfile{},
+	}
+
+	for i, bfd := range raw.BFDProfiles {
+		parsed, err := parseBFDProfile(bfd)
+		if err != nil {
+			return nil, fmt.Errorf("parsing bfd profile #%d: %s", i+1, err)
+		}
+		if _, ok := cfg.BFDProfiles[parsed.Name]; ok {
+			return nil, fmt.Errorf("found duplicate bfd profile name %s", parsed.Name)
+		}
+		cfg.BFDProfiles[bfd.Name] = parsed
+	}
+
 	for i, p := range raw.Peers {
 		peer, err := parsePeer(p)
 		if err != nil {
 			return nil, fmt.Errorf("parsing peer #%d: %s", i+1, err)
+		}
+		if peer.BFDProfile != "" {
+			if _, ok := cfg.BFDProfiles[peer.BFDProfile]; !ok {
+				return nil, fmt.Errorf("peer #%d referencing non existing bfd profile %s", i+1, peer.BFDProfile)
+			}
 		}
 		for _, ep := range cfg.Peers {
 			// TODO: Be smarter regarding conflicting peers. For example, two
@@ -208,13 +289,14 @@ func Parse(bs []byte) (*Config, error) {
 			if reflect.DeepEqual(peer, ep) {
 				return nil, fmt.Errorf("peer #%d already exists", i+1)
 			}
+
 		}
 		cfg.Peers = append(cfg.Peers, peer)
 	}
 
 	communities := map[string]uint32{}
 	for n, v := range raw.BGPCommunities {
-		c, err := parseCommunity(v)
+		c, err := ParseCommunity(v)
 		if err != nil {
 			return nil, fmt.Errorf("parsing community %q: %s", n, err)
 		}
@@ -256,6 +338,9 @@ func parsePeer(p peer) (*Peer, error) {
 	if p.ASN == 0 {
 		return nil, errors.New("missing peer ASN")
 	}
+	if p.ASN == p.MyASN && p.EBGPMultiHop {
+		return nil, errors.New("invalid ebgp-multihop parameter set for an ibgp peer")
+	}
 	ip := net.ParseIP(p.Addr)
 	if ip == nil {
 		return nil, fmt.Errorf("invalid peer IP %q", p.Addr)
@@ -263,6 +348,14 @@ func parsePeer(p peer) (*Peer, error) {
 	holdTime, err := parseHoldTime(p.HoldTime)
 	if err != nil {
 		return nil, err
+	}
+	keepaliveTime, err := parseKeepaliveTime(holdTime, p.KeepaliveTime)
+	if err != nil {
+		return nil, err
+	}
+	// keepalive must be lower than holdtime
+	if keepaliveTime > holdTime {
+		return nil, fmt.Errorf("invalid keepaliveTime %q", p.KeepaliveTime)
 	}
 	port := uint16(179)
 	if p.Port != 0 {
@@ -277,6 +370,10 @@ func parsePeer(p peer) (*Peer, error) {
 		if routerID == nil {
 			return nil, fmt.Errorf("invalid router ID %q", p.RouterID)
 		}
+	}
+	src := net.ParseIP(p.SrcAddr)
+	if p.SrcAddr != "" && src == nil {
+		return nil, fmt.Errorf("invalid source IP %q", p.SrcAddr)
 	}
 
 	// We use a non-pointer in the raw json object, so that if the
@@ -299,15 +396,20 @@ func parsePeer(p peer) (*Peer, error) {
 	if p.Password != "" {
 		password = p.Password
 	}
+
 	return &Peer{
 		MyASN:         p.MyASN,
 		ASN:           p.ASN,
 		Addr:          ip,
+		SrcAddr:       src,
 		Port:          port,
 		HoldTime:      holdTime,
+		KeepaliveTime: keepaliveTime,
 		RouterID:      routerID,
 		NodeSelectors: nodeSels,
 		Password:      password,
+		BFDProfile:    p.BFDProfile,
+		EBGPMultiHop:  p.EBGPMultiHop,
 	}, nil
 }
 
@@ -329,21 +431,23 @@ func parseAddressPool(p addressPool, bgpCommunities map[string]uint32) (*Pool, e
 	if len(p.Addresses) == 0 {
 		return nil, errors.New("pool has no prefixes defined")
 	}
+
+	cidrsPerAddresses := map[string][]*net.IPNet{}
 	for _, cidr := range p.Addresses {
-		nets, err := parseCIDR(cidr)
+		nets, err := ParseCIDR(cidr)
 		if err != nil {
 			return nil, fmt.Errorf("invalid CIDR %q in pool %q: %s", cidr, p.Name, err)
 		}
 		ret.CIDR = append(ret.CIDR, nets...)
+		cidrsPerAddresses[cidr] = nets
 	}
-
 	switch ret.Protocol {
 	case Layer2:
 		if len(p.BGPAdvertisements) > 0 {
 			return nil, errors.New("cannot have bgp-advertisements configuration element in a layer2 address pool")
 		}
 	case BGP:
-		ads, err := parseBGPAdvertisements(p.BGPAdvertisements, ret.CIDR, bgpCommunities)
+		ads, err := parseBGPAdvertisements(p.BGPAdvertisements, cidrsPerAddresses, bgpCommunities)
 		if err != nil {
 			return nil, fmt.Errorf("parsing BGP communities: %s", err)
 		}
@@ -357,35 +461,98 @@ func parseAddressPool(p addressPool, bgpCommunities map[string]uint32) (*Pool, e
 	return ret, nil
 }
 
-func parseBGPAdvertisements(ads []bgpAdvertisement, cidrs []*net.IPNet, communities map[string]uint32) ([]*BGPAdvertisement, error) {
+func parseBFDProfile(p bfdProfile) (*BFDProfile, error) {
+	if p.Name == "" {
+		return nil, fmt.Errorf("missing bfd profile name")
+	}
+	res := &BFDProfile{}
+	res.Name = p.Name
+	var err error
+	res.DetectMultiplier, err = bfdIntFromConfig(p.DetectMultiplier, 2, 255)
+	if err != nil {
+		return nil, errors.Wrap(err, "invalid detect multiplier value")
+	}
+	res.ReceiveInterval, err = bfdIntFromConfig(p.ReceiveInterval, 10, 60000)
+	if err != nil {
+		return nil, errors.Wrap(err, "invalid receive interval value")
+	}
+	res.TransmitInterval, err = bfdIntFromConfig(p.TransmitInterval, 10, 60000)
+	if err != nil {
+		return nil, errors.Wrap(err, "invalid transmit interval value")
+	}
+	res.MinimumTTL, err = bfdIntFromConfig(p.MinimumTTL, 1, 254)
+	if err != nil {
+		return nil, errors.Wrap(err, "invalid minimum ttl value")
+	}
+	res.EchoInterval, err = bfdIntFromConfig(p.EchoInterval, 10, 60000)
+	if err != nil {
+		return nil, errors.Wrap(err, "invalid minimum ttl value")
+	}
+	res.EchoMode = p.EchoMode
+	res.PassiveMode = p.PassiveMode
+
+	return res, nil
+}
+
+func parseBGPAdvertisements(ads []bgpAdvertisement, cidrsPerAddresses map[string][]*net.IPNet, communities map[string]uint32) ([]*BGPAdvertisement, error) {
 	if len(ads) == 0 {
 		return []*BGPAdvertisement{
 			{
-				AggregationLength: 32,
-				LocalPref:         0,
-				Communities:       map[uint32]bool{},
+				AggregationLength:   32,
+				AggregationLengthV6: 128,
+				LocalPref:           0,
+				Communities:         map[uint32]bool{},
 			},
 		}, nil
 	}
 
+	err := validateDuplicateAdvertisements(ads)
+	if err != nil {
+		return nil, err
+	}
+
 	var ret []*BGPAdvertisement
 	for _, rawAd := range ads {
+		err := validateDuplicateCommunities(rawAd.Communities)
+		if err != nil {
+			return nil, err
+		}
+
 		ad := &BGPAdvertisement{
-			AggregationLength: 32,
-			LocalPref:         0,
-			Communities:       map[uint32]bool{},
+			AggregationLength:   32,
+			AggregationLengthV6: 128,
+			LocalPref:           0,
+			Communities:         map[uint32]bool{},
 		}
 
 		if rawAd.AggregationLength != nil {
 			ad.AggregationLength = *rawAd.AggregationLength
 		}
 		if ad.AggregationLength > 32 {
-			return nil, fmt.Errorf("invalid aggregation length %q", ad.AggregationLength)
+			return nil, fmt.Errorf("invalid aggregation length %q for IPv4", ad.AggregationLength)
 		}
-		for _, cidr := range cidrs {
-			o, _ := cidr.Mask.Size()
-			if ad.AggregationLength < o {
-				return nil, fmt.Errorf("invalid aggregation length %d: prefix %q in this pool is more specific than the aggregation length", ad.AggregationLength, cidr)
+		if rawAd.AggregationLengthV6 != nil {
+			ad.AggregationLengthV6 = *rawAd.AggregationLengthV6
+			if ad.AggregationLengthV6 > 128 {
+				return nil, fmt.Errorf("invalid aggregation length %q for IPv6", ad.AggregationLengthV6)
+			}
+		}
+
+		for addr, cidrs := range cidrsPerAddresses {
+			if len(cidrs) == 0 {
+				continue
+			}
+			maxLength := ad.AggregationLength
+			if cidrs[0].IP.To4() == nil {
+				maxLength = ad.AggregationLengthV6
+			}
+
+			// in case of range format, we may have a set of cidrs associated to a given address.
+			// We reject if none of the cidrs are compatible with the aggregation length.
+			lowest := lowestMask(cidrs)
+			if maxLength < lowest {
+				return nil, fmt.Errorf("invalid aggregation length %d: prefix %q in "+
+					"this pool is more specific than the aggregation length for addresses %s", ad.AggregationLength, lowest, addr)
 			}
 		}
 
@@ -397,7 +564,7 @@ func parseBGPAdvertisements(ads []bgpAdvertisement, cidrs []*net.IPNet, communit
 			if v, ok := communities[c]; ok {
 				ad.Communities[v] = true
 			} else {
-				v, err := parseCommunity(c)
+				v, err := ParseCommunity(c)
 				if err != nil {
 					return nil, fmt.Errorf("invalid community %q in BGP advertisement: %s", c, err)
 				}
@@ -411,7 +578,7 @@ func parseBGPAdvertisements(ads []bgpAdvertisement, cidrs []*net.IPNet, communit
 	return ret, nil
 }
 
-func parseCommunity(c string) (uint32, error) {
+func ParseCommunity(c string) (uint32, error) {
 	fs := strings.Split(c, ":")
 	if len(fs) != 2 {
 		return 0, fmt.Errorf("invalid community string %q", c)
@@ -422,13 +589,19 @@ func parseCommunity(c string) (uint32, error) {
 	}
 	b, err := strconv.ParseUint(fs[1], 10, 16)
 	if err != nil {
-		return 0, fmt.Errorf("invalid second section of community %q: %s", fs[0], err)
+		return 0, fmt.Errorf("invalid second section of community %q: %s", fs[1], err)
 	}
 
 	return (uint32(a) << 16) + uint32(b), nil
 }
 
-func parseCIDR(cidr string) ([]*net.IPNet, error) {
+func CommunityToString(c uint32) string {
+	upperVal := c >> 16
+	lowerVal := c & 0xFFFF
+	return fmt.Sprintf("%d:%d", upperVal, lowerVal)
+}
+
+func ParseCIDR(cidr string) ([]*net.IPNet, error) {
 	if !strings.Contains(cidr, "-") {
 		_, n, err := net.ParseCIDR(cidr)
 		if err != nil {
@@ -448,6 +621,10 @@ func parseCIDR(cidr string) ([]*net.IPNet, error) {
 	end := net.ParseIP(strings.TrimSpace(fs[1]))
 	if end == nil {
 		return nil, fmt.Errorf("invalid IP range %q: invalid end IP %q", cidr, fs[1])
+	}
+
+	if bytes.Compare(start, end) > 0 {
+		return nil, fmt.Errorf("invalid IP range %q: start IP %q is after the end IP %q", cidr, start, end)
 	}
 
 	var ret []*net.IPNet
@@ -475,4 +652,50 @@ func cidrContainsCIDR(outer, inner *net.IPNet) bool {
 		return true
 	}
 	return false
+}
+
+func lowestMask(cidrs []*net.IPNet) int {
+	if len(cidrs) == 0 {
+		return 0
+	}
+	lowest, _ := cidrs[0].Mask.Size()
+	for _, c := range cidrs {
+		s, _ := c.Mask.Size()
+		if lowest > s {
+			lowest = s
+		}
+	}
+	return lowest
+}
+
+func bfdIntFromConfig(value *uint32, min, max uint32) (*uint32, error) {
+	if value == nil {
+		return nil, nil
+	}
+	if *value < min || *value > max {
+		return nil, fmt.Errorf("invalid value %d, must be in %d-%d range", *value, min, max)
+	}
+	return value, nil
+}
+
+func validateDuplicateAdvertisements(ads []bgpAdvertisement) error {
+	for i := 0; i < len(ads); i++ {
+		for j := i + 1; j < len(ads); j++ {
+			if reflect.DeepEqual(ads[i], ads[j]) {
+				return fmt.Errorf("duplicate definition of bgpadvertisements. advertisement %d and %d are equal", i+1, j+1)
+			}
+		}
+	}
+	return nil
+}
+
+func validateDuplicateCommunities(communities []string) error {
+	for i := 0; i < len(communities); i++ {
+		for j := i + 1; j < len(communities); j++ {
+			if communities[i] == communities[j] {
+				return fmt.Errorf("duplicate definition of community %q", communities[i])
+			}
+		}
+	}
+	return nil
 }

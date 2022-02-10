@@ -4,7 +4,6 @@ metadata:
   labels:
     app: metallb
   name: controller
-  namespace: metallb-system
 spec:
   allowPrivilegeEscalation: false
   allowedCapabilities: []
@@ -46,7 +45,6 @@ metadata:
   labels:
     app: metallb
   name: speaker
-  namespace: metallb-system
 spec:
   allowPrivilegeEscalation: false
   allowedCapabilities:
@@ -338,6 +336,7 @@ spec:
       - args:
         - --port=7472
         - --config=config
+        - --log-level=info
         env:
         - name: METALLB_NODE_NAME
           valueFrom:
@@ -373,6 +372,24 @@ spec:
         - containerPort: 7946
           name: memberlist-udp
           protocol: UDP
+        livenessProbe:
+          httpGet:
+            path: /metrics
+            port: monitoring
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 1
+          successThreshold: 1
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /metrics
+            port: monitoring
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 1
+          successThreshold: 1
+          failureThreshold: 3
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:
@@ -418,6 +435,7 @@ spec:
       - args:
         - --port=7472
         - --config=config
+        - --log-level=info
         env:
         - name: METALLB_ML_SECRET_NAME
           value: memberlist
@@ -428,6 +446,24 @@ spec:
         ports:
         - containerPort: 7472
           name: monitoring
+        livenessProbe:
+          httpGet:
+            path: /metrics
+            port: monitoring
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 1
+          successThreshold: 1
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /metrics
+            port: monitoring
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 1
+          successThreshold: 1
+          failureThreshold: 3
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:

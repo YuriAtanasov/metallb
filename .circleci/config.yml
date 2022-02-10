@@ -7,44 +7,16 @@ commands:
     steps:
       - checkout
       - run: sudo apt-get update
-      - run: sudo apt-get install python3-pip
+      - run: sudo apt-get install python3-pip arping ndisc6
       - run: sudo pip3 install invoke semver pyyaml
-  setup_kind:
-    description: "Install kind"
-    steps:
-      - run: GO111MODULE="on" go get sigs.k8s.io/kind@v0.10.0
-      - run: curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-      - run: sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
 jobs:
   test-1-16:
-    docker:
-      - image: cimg/go:1.16
+    machine:
+      image: ubuntu-2004:202104-01
     steps:
       - setup_ci_image
       - run: inv test
       - run: cp manifests/metallb.yaml manifests/metallb.yaml.prev
-  e2etest-bgp:
-    machine:
-      image: ubuntu-2004:202104-01
-    steps:
-      - setup_ci_image
-      - setup_kind
-      - run: inv build
-      - run: inv dev-env -p bgp
-      - run: inv e2etest -e /tmp/kind_logs
-      - store_artifacts:
-          path: /tmp/kind_logs
-  e2etest-layer2:
-    machine:
-      image: ubuntu-2004:202104-01
-    steps:
-      - setup_ci_image
-      - setup_kind
-      - run: inv build
-      - run: inv dev-env -p layer2
-      - run: inv e2etest -e /tmp/kind_logs
-      - store_artifacts:
-          path: /tmp/kind_logs
   lint-1-16:
     docker:
       - image: cimg/go:1.16
@@ -52,29 +24,12 @@ jobs:
       - setup_ci_image
       - run: inv checkpatch
       - run: inv lint -e host
-  # FIXME: this is pinned to v3.0.0 because subsequent versions of ct pull in new versions of helm, which are subject
-  #        to this bug: https://github.com/helm/helm/issues/8835, specifically for rbac object names with ':' in them
-  helm-lint:
-    working_directory: /repo
-    docker:
-      - image: quay.io/helmpack/chart-testing:v3.0.0
-    steps:
-      - checkout
-      - run: ct lint
-  # FIXME: instrumenta/helm-conftest does not yet support helm v3, v2 causes tests to fail.
-  #        Switch to it once https://github.com/instrumenta/helm-conftest/pull/8 is merged
-  helm-conftest:
-    working_directory: /repo
-    docker:
-      - image: alpine/helm:3.2.4
-    steps:
-      - run: apk add --update --no-cache git curl bash
-      - run: helm plugin install --debug https://github.com/instrumenta/helm-conftest
-      - checkout
-      - run: helm conftest charts/metallb/ -p charts/metallb/policy/ --fail-on-warn
+      - run: inv verifylicense
   publish-images:
     docker:
       - image: cimg/go:1.16
+    environment:
+      - DOCKER_BUILD_CMD: "docker buildx build --load"
     steps:
       # This job should not run against PRs, but we have seen it run unexpectedly, so
       # double check and exit early if this is a job against a PR.
@@ -88,6 +43,8 @@ jobs:
   publish-images-quay:
     docker:
       - image: cimg/go:1.16
+    environment:
+      - DOCKER_BUILD_CMD: "docker buildx build --load"
     steps:
       # This job should not run against PRs, but we have seen it run unexpectedly, so
       # double check and exit early if this is a job against a PR.
@@ -107,22 +64,6 @@ workflows:
             tags:
               only: /.*/
       - lint-1-16:
-          filters:
-            tags:
-              only: /.*/
-      - helm-lint:
-          filters:
-            tags:
-              only: /.*/
-      - helm-conftest:
-          filters:
-            tags:
-              only: /.*/
-      - e2etest-bgp:
-          filters:
-            tags:
-              only: /.*/
-      - e2etest-layer2:
           filters:
             tags:
               only: /.*/
